@@ -1,253 +1,250 @@
 import os 
-import numpy as np 
-from typing import Tuple, List, Optional, Union, Literal
-from PIL import Image
+import sys
+import shutil
+from typing import Dict, Tuple, List, Optional 
 
+import numpy as np 
+import matplotlib 
+# matplotlib.use('gtk3agg')
+import matplotlib.pyplot as plt
 import torch 
 from torch import nn 
-import torch.nn.functional as F
-from torch.optim import AdamW
-
-import matplotlib.pyplot as plt 
+from torch.nn import functional as F 
+import cv2 
 
 DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
+from homography import Homography, Trainer, mse, contrastive_sim, dv_loss, histogram_mutual_information
 
-
-class Homography(nn.Module): 
-    def __init__(self): 
-        super().__init__()  
-        self.basis = torch.zeros((8, 3, 3), device=DEVICE)
-        self.basis[0,0,2] = 1. 
-        self.basis[1,1,2] = 1. 
-        self.basis[2,0,1] = 1. 
-        self.basis[3,1,0] = 1.
-        self.basis[4,0,0], self.basis[4,1,1] = 1., -1. 
-        self.basis[5,1,1], self.basis[5,2,2] = -1., 1.
-        self.basis[6,2,0] = 1. 
-        self.basis[7,2,1] = 1. 
-
-        self.v = nn.Parameter(torch.zeros((8,1,1), device=DEVICE)*0.1, requires_grad=True) 
-        self.conv = nn.Conv2d(1, 1, 3, padding="same").to(DEVICE)
-        nn.init.zeros_(self.conv.weight)
-        nn.init.zeros_(self.conv.bias)
-
-    def forward(self, I: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]: 
-        """
-        I: torch.Tensor[B, C, H, W]
-        """
-        H = self.Mexp(self.basis, self.v) 
-        
-        h, w = I.shape[-2], I.shape[-1]
-        x = torch.linspace(-1, 1, w, device=DEVICE)
-        y = torch.linspace(-1, 1, h, device=DEVICE) 
-        xx, yy = torch.meshgrid(x, y, indexing='xy') 
-        grid = torch.stack([xx, yy], dim=-1).reshape(-1, 2).T
-        grid_t = H @ torch.cat([grid, torch.ones_like(grid[-1:, :], device=DEVICE)], dim=0)
-        grid_t /= grid_t[2:, :].clone()
-        xx_t, yy_t = grid_t[0, :].reshape(xx.shape), grid_t[1, :].reshape(yy.shape)
-
-        grid_sample = torch.stack([xx_t, yy_t], dim=-1)[None, :, :, :]
-        J = F.grid_sample(I, grid_sample, align_corners=False)
-        return J, H 
+def init_tracker(frame: np.ndarray, trainer: Trainer): 
     
-    def Mexp(self, B, v): 
-        A = torch.eye(3, device=DEVICE)
-        n_fact = 1
-        H = torch.eye(3, device=DEVICE)
-        for i in range(11): 
-            A = (v * B).sum(dim=0) @ A
-            n_fact = max(i, 1) * n_fact
-            A /= n_fact
-            H += A 
-        return H / H[2, 2]
-
-    def log_factorial(self, x):
-        return torch.lgamma(x + 1)
-    def factorial(self, x): 
-        return torch.exp(self.log_factorial(x))
+    fh, fw, c = frame.shape
 
 
+    # plt.imshow(frame[:, :, ::-1])
+    points = [] #plt.ginput(4)
+
+    if len(points) == 0: 
+        points = [[1236, 540], [1245, 1404], [2200, 558], [2184, 1275]] # window on screen
+        points = [[14, 303], [218, 290], [40, 560], [237, 532]] # cereal box
+        points = [[297, 296], [465, 287], [312, 522], [470, 511]] # book 1
+        points = [[264, 273], [423, 272],  [282, 488], [432, 494]] # book 2
+    # plt.show()
+    points = np.array(points)
+    x = points[:, 0] # x 
+    y = points[:, 1] # y
+
+    # sorting the points into tl, tr, bl, br
+    min_x = x.min() 
+    min_y = y.min() 
+    max_x = x.max() 
+    max_y = y.max() 
+
+    dist_to_tl = np.sqrt((x - min_x)**2 + (y - min_y)**2) 
+    idx_tl = np.argmin(dist_to_tl) 
+    dist_to_br = np.sqrt((x-max_x)**2 + (y - max_y)**2) 
+    idx_br = np.argmin(dist_to_br) 
+
+    dist_to_tr = np.sqrt((x - max_x)**2 + (y - min_y)**2) 
+    idx_tr = np.argmin(dist_to_tr) 
+    dist_to_bl = np.sqrt((x-min_x)**2 + (y - max_y)**2) 
+    idx_bl = np.argmin(dist_to_bl) 
+
+    # raw points
+    tl = points[idx_tl]
+    tr = points[idx_tr]
+    bl = points[idx_bl]
+    br = points[idx_br]
+    # design points
+    tl_rec = np.array([-1, -1], dtype=np.float32)
+    tr_rec = np.array([1, -1], dtype=np.float32)
+    bl_rec = np.array([-1, 1], dtype=np.float32)
+    br_rec = np.array([1, 1], dtype=np.float32)
+
+    dst_points = np.stack([tl_rec, tr_rec, bl_rec, br_rec], axis=0)
+    src_points = np.stack([tl, tr, bl, br], axis=0).astype(np.float64)
+
+    # scaling source points between -1 and 1
+    src_points[:, 0] = 2*src_points[:, 0] / fw - 1 
+    src_points[:, 1] = 2*src_points[:, 1] / fh - 1 
+
+    # raw --> design
+    H, _ = cv2.findHomography(src_points, dst_points, cv2.RANSAC, 5.0) 
+    H = np.linalg.inv(H) # design --> raw
+    H /= H[2, 2]
+
+    test_points = np.concatenate([dst_points, np.ones_like(dst_points[:, -1:])], axis=1) 
+
+    output_points = H @ test_points.transpose(1, 0) 
+    output_points /= output_points[2:, :] 
+    output_points = output_points[:2, :].transpose(1, 0) 
+
+    output_points[:, 0] = (output_points[:, 0] + 1) * fw / 2
+    output_points[:, 1] = (output_points[:, 1] + 1) * fh / 2
+
+    output_points = [list(output_points[i].astype(int)) for i in range(output_points.shape[0])]
+
+    # cv2.line(frame, output_points[0], output_points[1], (0, 255, 0), 5)
+    # cv2.line(frame, output_points[1], output_points[3], (0, 255, 0), 5)
+    # cv2.line(frame, output_points[3], output_points[2], (0, 255, 0), 5)
+    # cv2.line(frame, output_points[2], output_points[0], (0, 255, 0), 5)
+
+    # print("OUTPUT POINTS", output_points)
+
+    # cv2.imshow("test homography visualization", frame)
+    # plt.show()
+
+    w = int(max(np.abs(tl[0] - tr[0]), np.abs(bl[0] - br[0])))
+    h = int(max(np.abs(tl[1] - bl[1]), np.abs(tr[1] - br[1]))) 
 
 
-class Trainer: 
-    def __init__(self, 
-                 Hnet, 
-                 lr=1e-2,
-                 levels=3,
-                 steps_per_epoch=10, 
-                 loss_fn=None): 
-        self.Hnet = Hnet
-        self.optim = AdamW(self.Hnet.parameters(), lr=lr)
-        self.levels = levels 
-        self.steps_per_epoch = steps_per_epoch
-        self.loss_fn = loss_fn
-        if self.loss_fn is None: 
-            self.loss_fn = mse
+    with torch.no_grad():
+        x = torch.linspace(-1, 1, w, device=DEVICE)
+        y = torch.linspace(-1, 1, h, device=DEVICE)
+
+        xx, yy = torch.meshgrid(x, y, indexing="xy")
+
+        design_grid = torch.stack([xx, yy], dim=-1).reshape(-1, 2) 
+        design_grid = torch.cat([design_grid, torch.ones_like(design_grid)[:, -1:]], dim=1)
+
+        H_ref = torch.from_numpy(H).to(DEVICE).float()
+
+        raw_grid = H_ref @ design_grid.T
+
+        raw_grid /= raw_grid[-1:, :].clone()
+        raw_grid = raw_grid[:2, :].T.reshape(h, w, 2)[None, ...]
+
+        frame_torch = torch.from_numpy(frame).to(DEVICE).permute(2, 0, 1)[None, ...].float()
+
+        template = F.grid_sample(frame_torch, raw_grid, "bilinear", align_corners=False, padding_mode="zeros")
+
+    template_np = template.permute(0, 2, 3, 1).detach().cpu().numpy()[0]
+    # cv2.imshow("template", template_np)
+    # plt.show()
+
+    Hnet = trainer.solve_initial(H_ref, template)
 
 
-    def convert_img_to_torch(self, imgI: np.ndarray) -> torch.Tensor: 
-
-        if imgI.ndim == 2: 
-            I = torch.from_numpy(imgI).float().to(DEVICE)[None, None, :, :]
-        elif imgI.ndim == 3:  
-            I = torch.permute(torch.from_numpy(imgI), 
-                            (2, 0, 1)).float().to(DEVICE)[None, :, :, :]
-        return I 
-
-    def register(self, imgI: np.ndarray, imgJ: np.ndarray): 
-
-        I = self.convert_img_to_torch(imgI)
-        J = self.convert_img_to_torch(imgJ)
-        with torch.no_grad(): 
-            J_w, H = self.Hnet(J)
-            pre_reg_J = J_w.detach().cpu().numpy()[0, 0]
-            plt.imshow(pre_reg_J)
-            plt.savefig("pre-registration-J.png")
-
-        scales = 2.0**torch.arange(-self.levels, 1, device=DEVICE)
-
-
-        for level in range(1, self.levels + 1): 
-
-            I_s, J_s = self.scale(I, scales[level]), self.scale(J, scales[level])
-            scale_J = J_s.detach().cpu().numpy()[0, 0]
-            plt.imshow(scale_J)
-            plt.savefig(f"scale_{scales[level]}--{level}.png")
-
-            nn.init.zeros_(self.Hnet.conv.weight)
-            nn.init.zeros_(self.Hnet.conv.bias)
-
-            for step in range(self.steps_per_epoch): 
-                self.Hnet.zero_grad()                
-                J_w, H = self.Hnet(J_s)
-                J_w = self.Hnet.conv(J_w) + J_w
-                loss = self.loss_fn(I_s.flatten(), J_w.flatten())
-                loss.backward() 
-                self.optim.step() 
-                print(loss.item())
-            
-
-        return J_w, H
-
-    def scale(self, I, s): 
-
-
-        k_x = torch.linspace(-1/s, 1/s, int(2/s - 1), device=DEVICE) 
-        xx, yy = torch.meshgrid(k_x, k_x, indexing="xy")
-        kernel = torch.exp(-0.5 * (xx**2 + yy**2)/s**2)
-        kernel /= kernel.sum()
-        kernel = kernel[None, None, :, :]
-        kernel += torch.zeros((I.shape[1], 1, 1, 1), device=DEVICE)
-        I_smooth = F.conv2d(I, kernel, groups=I.shape[1]) 
-
-
-        h, w = I.shape[-1], I.shape[-2]
-
-        x = torch.linspace(-1, 1, int(s*w), device=DEVICE)
-        y = torch.linspace(-1, 1, int(s*h), device=DEVICE) 
-
-        xx, yy = torch.meshgrid(x, y, indexing='xy') 
-        grid_s = torch.stack([xx, yy], dim=-1)[None, :, :, :]
-
-        Is = F.grid_sample(I_smooth, grid_s, align_corners=False)
-
-        return Is
+    return Hnet, template_np
 
 
 
-"""
-This code was obtained from https://discuss.pytorch.org/t/differentiable-torch-histc/25865/3. 
-"""
-class GaussianHistogram(nn.Module):
-    def __init__(self, bins, min, max, sigma):
-        super(GaussianHistogram, self).__init__()
-        self.bins = bins
-        self.min = min
-        self.max = max
-        self.sigma = sigma
-        self.delta = float(max - min) / float(bins)
-        self.centers = float(min) + self.delta * (torch.arange(bins, device=DEVICE).float() + 0.5)
+def main(filename): 
 
-    def forward(self, x):
-        x = torch.unsqueeze(x, 0) - torch.unsqueeze(self.centers, 1)
-        x = torch.exp(-0.5*(x/self.sigma)**2) / (self.sigma * np.sqrt(np.pi*2)) * self.delta
-        x = x.sum(dim=1)
-        return x
+    cap = cv2.VideoCapture(filename)
+    count = 0
 
-class GaussianHistogram(nn.Module):
-    def __init__(self, bins, min, max, sigma):
-        super(GaussianHistogram, self).__init__()
-        self.bins = bins
-        self.min = min
-        self.max = max
-        self.sigma = sigma
-        self.delta = float(max - min) / float(bins)
-        self.centers = float(min) + self.delta * (torch.arange(bins, device=DEVICE).float() + 0.5)
+    if os.path.isdir("tracked_regions"):
+        shutil.rmtree("tracked_regions/")
+        shutil.rmtree("frames/")
+    os.makedirs("tracked_regions/", exist_ok=True)
+    os.makedirs("frames/", exist_ok=True)
 
-    def forward(self, x, y):
-        x = (torch.unsqueeze(x, 0) - torch.unsqueeze(self.centers, 1))[:, ::100]
-        y = (torch.unsqueeze(y, 0) - torch.unsqueeze(self.centers, 1))[:, ::100]
+    H = Homography(features=16)
+    trainer = Trainer(H, 
+                      lr=3e-4, 
+                      levels=3, 
+                      steps_per_epoch=100, 
+                      loss_fn=dv_loss)
+    
+    f = open("metrics.csv", "w") 
+    f.write("Mutual information\n")
 
-        xy = (x[:, None, :]**2 + y[None, :, :]**2)
+    while cap.isOpened():
+        ret,frame = cap.read()
 
-        hist = torch.exp(-0.5*(xy)/self.sigma**2) / (self.sigma**2 * np.pi*2) * self.delta
-        hist = hist.sum(dim=-1)
-        return hist * 100
+        frame = frame.astype(np.float32) / 255.
+        fh, fw, c = frame.shape
 
 
-def mse(targets: torch.Tensor, inputs: torch.Tensor): 
-    mse_loss = F.mse_loss(inputs, targets) 
-    return mse_loss 
+        if count == 0: 
+            H, template = init_tracker(frame, trainer)
 
-def histogram_mutual_information(image1, image2):
-    hgram, x_edges, y_edges = np.histogram2d(image1.ravel(), image2.ravel(), bins=100)
-    pxy = hgram / float(np.sum(hgram))
-    px = np.sum(pxy, axis=1)
-    py = np.sum(pxy, axis=0)
-    px_py = px[:, None] * py[None, :]
-    nzs = pxy > 0
-    return np.sum(pxy[nzs] * np.log(pxy[nzs] / px_py[nzs]))
+
+        h, w, c = template.shape
+
+
+        with torch.no_grad():
+            x = torch.linspace(-1, 1, w, device=DEVICE)
+            y = torch.linspace(-1, 1, h, device=DEVICE)
+
+            xx, yy = torch.meshgrid(x, y, indexing="xy")
+
+            design_grid = torch.stack([xx, yy], dim=-1).reshape(-1, 2) 
+            design_grid = torch.cat([design_grid, torch.ones_like(design_grid)[:, -1:]], dim=1)
+
+            tracked, _ = H(torch.from_numpy(frame).to(DEVICE).permute(2, 0, 1)[None, ...])
+
+        tracked = tracked.permute(0, 2, 3, 1).detach().cpu().numpy()[0]
+        # cv2.imshow("tracked before reg", tracked)
+
+        
+        tracked_w, H_mat = trainer.register(template, frame)
+        tracked_w = tracked_w.permute(0, 2, 3, 1).detach().cpu().numpy()[0]
+        # cv2.imshow("tracked after reg", tracked_w)
+
+        # cv2.imshow('window-name', frame)
+        cv2.imwrite(f"tracked_regions/frame{count:05d}.jpg", (tracked_w * 255.).astype(np.uint8)) 
+
+
+        ##### VISUALIZE BOX #######
+
+        # design points
+        tl_rec = np.array([-1, -1], dtype=np.float32)
+        tr_rec = np.array([1, -1], dtype=np.float32)
+        bl_rec = np.array([-1, 1], dtype=np.float32)
+        br_rec = np.array([1, 1], dtype=np.float32)
+
+        dst_points = np.stack([tl_rec, tr_rec, bl_rec, br_rec], axis=0)
+
+        # raw --> design
+        test_points = np.concatenate([dst_points, np.ones_like(dst_points[:, -1:])], axis=1) 
+
+        output_points = H_mat.detach().cpu().numpy() @ test_points.transpose(1, 0) 
+        output_points /= output_points[2:, :] 
+        output_points = output_points[:2, :].transpose(1, 0) 
+
+        output_points[:, 0] = (output_points[:, 0] + 1) * fw / 2
+        output_points[:, 1] = (output_points[:, 1] + 1) * fh / 2
+
+        output_points = [list(output_points[i].astype(int)) for i in range(output_points.shape[0])]
+
+        cv2.line(frame, output_points[0], output_points[1], (0, 1, 0), 5)
+        cv2.line(frame, output_points[1], output_points[3], (0, 1, 0), 5)
+        cv2.line(frame, output_points[3], output_points[2], (0, 1, 0), 5)
+        cv2.line(frame, output_points[2], output_points[0], (0, 1, 0), 5)
+
+        print("OUTPUT POINTS", output_points)
+
+        # cv2.imshow("test homography visualization", frame)
+        cv2.imwrite(f"frames/frame{count:05d}.jpg", (frame * 255.).astype(np.uint8))
+
+
+        ## Compute MI score 
+
+        mi = histogram_mutual_information(template, tracked_w)
+
+        f.write(f"{mi}\n")
+
+
+
+
+
+
+
+
+
+        count = count + 1
+        if cv2.waitKey(10) & 0xFF == ord('q'):
+            break
+    cap.release()
+    cv2.destroyAllWindows() # destroy all opened windows
+    f.close()
 
 
 if __name__ == "__main__": 
-    
-    Hnet = Homography().to(DEVICE) 
-    
-    # I = torch.zeros((1, 1, 5, 6), device=DEVICE)
 
-    imgI = Image.open("knee1.bmp")
-    imgI = np.array(imgI) / 255.
-    imgJ = Image.open("knee2.bmp")
-    imgJ = np.array(imgJ) / 255.
-    
-    plt.imshow(imgI)
-    plt.savefig("imgI.png")
-
-    plt.imshow(imgJ)
-    plt.savefig("imgJ.png")
-
-    Hnet = Homography() 
-
-
-
-
-    trainer = Trainer(
-        Hnet, 
-        lr=1e-3, 
-        levels=5, 
-        steps_per_epoch=1000, 
-        loss_fn=mse, 
-    )
-    J, H = trainer.register(imgI, imgJ) 
-
-    registered_J = J.detach().cpu().numpy()[0, 0]
-    plt.imshow(registered_J)
-    plt.savefig("registered_J.png")
-
-
-    pre_mi = histogram_mutual_information(image1=imgI, image2=imgJ)
-    post_mi = histogram_mutual_information(image1=imgI, image2=registered_J)
-
-    print(f"MI before registering: {pre_mi}")
-    print(f"MI after registering: {post_mi}")
+    if len(sys.argv) > 1: 
+        main(sys.argv[1]) 
+    else: 
+        print("Usage: python3 main.py <video_file_name>")
