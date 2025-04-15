@@ -128,10 +128,13 @@ class Trainer:
                  lr=1e-3,
                  levels=3,
                  steps_per_epoch=10, 
+                 encode_weight_decay=3e-4, 
+                 shrink_lmbda=0.99, 
+                 perturb_spread=1e-5, 
                  loss_fn=None): 
         self.Hnet = Hnet
         self.optim = torch.optim.AdamW([{"params": self.Hnet.v, "lr": lr}, 
-                            {"params": self.Hnet.encode.parameters(), "lr": lr*10, "weight_decay": 3e-4}])
+                            {"params": self.Hnet.encode.parameters(), "lr": lr*10, "weight_decay": encode_weight_decay}])
         self.levels = levels 
         self.steps_per_epoch = steps_per_epoch
         self.loss_fn = loss_fn
@@ -139,6 +142,9 @@ class Trainer:
             self.loss_fn = mse
 
         self.lr = lr
+        self.encode_weight_decay = encode_weight_decay
+        self.shrink_lmbda = shrink_lmbda
+        self.perturb_spread = perturb_spread
 
     def convert_img_to_torch(self, imgI: np.ndarray) -> torch.Tensor: 
 
@@ -151,7 +157,7 @@ class Trainer:
 
     def register(self, imgI: np.ndarray, imgJ: np.ndarray): 
         # self.Hnet.reset_encoder()
-        self.Hnet.shrink_perturb(lmbda=0.99, spread=1e-5)
+        self.Hnet.shrink_perturb(lmbda=self.shrink_lmbda, spread=self.perturb_spread)
         self.optim = torch.optim.AdamW([{"params": self.Hnet.v, "lr": self.lr}, 
                             {"params": self.Hnet.encode.parameters(), "lr": self.lr*10, "weight_decay": 3e-4}])
         I = self.convert_img_to_torch(imgI)
@@ -177,11 +183,8 @@ class Trainer:
             for step in range(self.steps_per_epoch): 
                 self.Hnet.zero_grad()                
                 J_w, H = self.Hnet(J_s, size=(h_, w_))
-                # J_w = self.Hnet.conv(J_w) + J_w
-                # Q, K = self.Hnet.encode_image(I_s, (k_h, k_w)), self.Hnet.encode_image(J_w, (k_h, k_w))
                 loss = self.loss_fn(I_s, J_w, encode_function=self.Hnet.encode_image)
                 loss.backward() 
-
 
                 cur_v = deepcopy(self.Hnet.v)
 

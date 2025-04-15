@@ -12,23 +12,33 @@ from torch import nn
 from torch.nn import functional as F 
 import cv2 
 
+from argparse import ArgumentParser, Namespace
+
 DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 from homography import Homography, Trainer, mse, contrastive_sim, dv_loss, histogram_mutual_information
 
-def init_tracker(frame: np.ndarray, trainer: Trainer): 
+def init_tracker(frame: np.ndarray, trainer: Trainer, mode="manual"): 
     
     fh, fw, c = frame.shape
 
 
     # plt.imshow(frame[:, :, ::-1])
-    points = [] #plt.ginput(4)
+    if mode == "manual":
+        plt.imshow(frame[:, :, ::-1])
+        points = plt.ginput(4)
+    else:
+        points = [] #plt.ginput(4)
 
     if len(points) == 0: 
-        points = [[1236, 540], [1245, 1404], [2200, 558], [2184, 1275]] # window on screen
-        points = [[14, 303], [218, 290], [40, 560], [237, 532]] # cereal box
-        points = [[297, 296], [465, 287], [312, 522], [470, 511]] # book 1
-        points = [[264, 273], [423, 272],  [282, 488], [432, 494]] # book 2
+        if mode == "cereal":
+            points = [[38, 323], [202, 308], [216, 517], [54, 540]] # cereal box new
+        elif mode == "book1": 
+            points = [[315, 311], [451, 306], [457, 494], [326, 502]] # book 1 new
+        elif mode == "book3":
+            points = [[303, 308], [415, 308],  [422, 465], [310, 465]] # book 3 new
+        else: 
+            raise ValueError(f"invalid mode: {mode}")
     # plt.show()
     points = np.array(points)
     x = points[:, 0] # x 
@@ -129,7 +139,7 @@ def init_tracker(frame: np.ndarray, trainer: Trainer):
 
 
 
-def main(filename): 
+def main(filename:str, args:Namespace): 
 
     cap = cv2.VideoCapture(filename)
     count = 0
@@ -142,13 +152,16 @@ def main(filename):
 
     H = Homography(features=16)
     trainer = Trainer(H, 
-                      lr=3e-4, 
+                      lr=1e-3, 
                       levels=3, 
                       steps_per_epoch=100, 
-                      loss_fn=dv_loss)
+                      loss_fn=mse if args.objective == "mse" else dv_loss)
     
     f = open("metrics.csv", "w") 
     f.write("Mutual information\n")
+
+    point_f = open("points.tsv", "w")
+    point_f.write("frame\tulx\tuly\turx\tury\tlrx\tlry\tllx\tlly\n")
 
     while cap.isOpened():
         ret,frame = cap.read()
@@ -158,7 +171,7 @@ def main(filename):
 
 
         if count == 0: 
-            H, template = init_tracker(frame, trainer)
+            H, template = init_tracker(frame, trainer, args.mode)
 
 
         h, w, c = template.shape
@@ -207,6 +220,10 @@ def main(filename):
         output_points[:, 0] = (output_points[:, 0] + 1) * fw / 2
         output_points[:, 1] = (output_points[:, 1] + 1) * fh / 2
 
+        
+        p = [list(output_points[i]) for i in range(output_points.shape[0])]
+
+
         output_points = [list(output_points[i].astype(int)) for i in range(output_points.shape[0])]
 
         cv2.line(frame, output_points[0], output_points[1], (0, 1, 0), 5)
@@ -214,7 +231,9 @@ def main(filename):
         cv2.line(frame, output_points[3], output_points[2], (0, 1, 0), 5)
         cv2.line(frame, output_points[2], output_points[0], (0, 1, 0), 5)
 
-        print("OUTPUT POINTS", output_points)
+        print("OUTPUT POINTS", output_points) # Points are in the form tl, tr, bl, br 
+        
+
 
         # cv2.imshow("test homography visualization", frame)
         cv2.imwrite(f"frames/frame{count:05d}.jpg", (frame * 255.).astype(np.uint8))
@@ -224,6 +243,8 @@ def main(filename):
 
         mi = histogram_mutual_information(template, tracked_w)
 
+
+        point_f.write(f"frame{count+1:05d}.jpg\t{p[0][0]}\t{p[0][1]}\t{p[1][0]}\t{p[1][1]}\t{p[3][0]}\t{p[3][1]}\t{p[2][0]}\t{p[2][1]}\n")
         f.write(f"{mi}\n")
 
 
@@ -244,7 +265,23 @@ def main(filename):
 
 if __name__ == "__main__": 
 
-    if len(sys.argv) > 1: 
-        main(sys.argv[1]) 
+
+    parser = ArgumentParser(description="MI-based tracker")
+    parser.add_argument("input_video", type=str, help="input video sequence to track")
+    parser.add_argument("--mode", 
+                        type=str, 
+                        default="manual", 
+                        choices=["manual", "cereal", "book1", "book3"], 
+                        help="Either load present key points for tracking, or manually select key points. Defaults to manual.")
+    parser.add_argument("--objective", 
+                        type=str, 
+                        default="mse", 
+                        choices=["mse", "dv"], 
+                        help="Tracking objective. Chose between mse (mean squared error) or dv (Donsker-Varadhan dual representation of MI)")
+    
+    args = parser.parse_args()
+
+    if os.path.isfile(args.input_video):
+        main(args.input_video, args) 
     else: 
-        print("Usage: python3 main.py <video_file_name>")
+        print(f"file not found: {args.input_video}")
